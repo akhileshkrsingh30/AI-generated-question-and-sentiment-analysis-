@@ -40,14 +40,18 @@ app.add_middleware(
 # ---------------------- Request Schema ----------------------
 class RequestModel(BaseModel):
     query: str
-    model: str  # user selects model (optional but required field)
+    model: str
+    user_id: str = "default_user"
+    session_id: str = "default_session"
 
 
 class SentimentRequest(BaseModel):
     responses: list[str]
     model: str
-    analysis_type: str = "count"  # Options: "count", "summary", "custom"
-    custom_prompt: str = None  # Optional custom prompt
+    analysis_type: str = "count"
+    custom_prompt: str = None
+    user_id: str = "default_user"
+    session_id: str = "default_session"
 
 
 
@@ -250,6 +254,8 @@ def generate_question(request: RequestModel):
 
     return {
         "status": "success",
+        "user_id": request.user_id,
+        "session_id": request.session_id,
         "model_used": request.model,
         "topic_detected": topic,
         "question_count": num_questions,
@@ -277,6 +283,8 @@ def analyze_sentiment(request: SentimentRequest):
 
     response_data = {
         "status": "success",
+        "user_id": request.user_id,
+        "session_id": request.session_id,
         "model_used": request.model,
         "analysis_type": request.analysis_type,
         "total_responses": len(request.responses),
