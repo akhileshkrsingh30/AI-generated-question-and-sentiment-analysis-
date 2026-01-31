@@ -1,0 +1,3 @@
+@echo off
+echo Starting AI Survey Generator API on port 8080...
+python app.py
