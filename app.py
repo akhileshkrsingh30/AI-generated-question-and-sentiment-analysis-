@@ -5,6 +5,7 @@ from openai import OpenAI
 import json
 import re
 import os
+import tiktoken
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -15,6 +16,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("❌ Environment variable OPENAI_API_KEY is missing.")
+
+# Initialize tiktoken encoding
+encoding = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return len(encoding.encode(text))
 
 
 
@@ -112,7 +121,7 @@ class SurveyGenerator:
             if match:
                 content = match.group(0)
 
-            return json.loads(content)
+            return json.loads(content), prompt, content
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"OpenAI Error: {str(e)}")
@@ -189,13 +198,13 @@ class SentimentAnalyzer:
                 match = re.search(r"\{.*\}", content, re.DOTALL)
                 if match:
                     json_content = match.group(0)
-                    return json.loads(json_content)
+                    return json.loads(json_content), prompt, content
                 else:
                     # If no JSON structure found, try loading the whole content
-                    return json.loads(content)
+                    return json.loads(content), prompt, content
             except json.JSONDecodeError:
                 # If JSON parsing fails, return the raw content
-                return content
+                return content, prompt, content
 
 
         except Exception as e:
@@ -229,18 +238,27 @@ def generate_question(request: RequestModel):
 
     prompt = generator.build_prompt(topic, num_questions)
 
-    response = generator.call_openai(prompt, request.model)
+    response_json, full_prompt, raw_content = generator.call_openai(prompt, request.model)
 
     # cleanup
-    for q in response.get("questions", []):
+    for q in response_json.get("questions", []):
         q["text"] = generator.enforce_limit(generator.clean_text(q["text"]))
+
+    # Count tokens
+    input_tokens = count_tokens(full_prompt)
+    output_tokens = count_tokens(raw_content)
 
     return {
         "status": "success",
         "model_used": request.model,
         "topic_detected": topic,
         "question_count": num_questions,
-        "survey": response
+        "token_usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        },
+        "survey": response_json
     }
 
 
@@ -251,13 +269,22 @@ def analyze_sentiment(request: SentimentRequest):
 
     analyzer = SentimentAnalyzer()
     prompt = analyzer.build_prompt(request.responses, request.analysis_type, request.custom_prompt)
-    result = analyzer.call_openai(prompt, request.model)
+    result, full_prompt, raw_content = analyzer.call_openai(prompt, request.model)
+
+    # Count tokens
+    input_tokens = count_tokens(full_prompt)
+    output_tokens = count_tokens(raw_content)
 
     response_data = {
         "status": "success",
         "model_used": request.model,
         "analysis_type": request.analysis_type,
         "total_responses": len(request.responses),
+        "token_usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        }
     }
 
     if request.custom_prompt:
