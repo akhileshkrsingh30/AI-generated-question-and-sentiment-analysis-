@@ -1,12 +1,18 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 import json
 import re
 import os
 import tiktoken
+import requests
+import logging
+from typing import Optional
+from fastapi import Header, Depends, Body
 from dotenv import load_dotenv
+import motor.motor_asyncio
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -17,14 +23,94 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("❌ Environment variable OPENAI_API_KEY is missing.")
 
+# Get default model from env
+DEFAULT_MODEL = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+
 # Initialize tiktoken encoding
 encoding = tiktoken.get_encoding("cl100k_base")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Authentication API URL
+AUTH_API_URL = "http://10.199.207.155:8083/jwt-0.0.1-SNAPSHOT/api/protected"
 
 def count_tokens(text: str) -> int:
     if not text:
         return 0
     return len(encoding.encode(text))
 
+# MongoDB Configuration
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "SurveyAI question")
+
+# Initialize MongoDB client
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+mongo_db = client[MONGO_DB_NAME]
+
+# Database for User Management and Result Storage
+class Database:
+    def __init__(self):
+        self.users = mongo_db["users"]
+        self.survey_results = mongo_db["survey_results"]
+        self.sentiment_results = mongo_db["sentiment_results"]
+
+    async def get_or_create_user(self, username: str):
+        user = await self.users.find_one({"username": username})
+        if not user:
+            user = {
+                "username": username,
+                "created_at": datetime.utcnow(),
+                "last_login": datetime.utcnow()
+            }
+            await self.users.insert_one(user)
+        else:
+            await self.users.update_one(
+                {"username": username},
+                {"$set": {"last_login": datetime.utcnow()}}
+            )
+        return user
+
+    async def save_survey(self, data: dict):
+        data["timestamp"] = datetime.utcnow()
+        await self.survey_results.insert_one(data)
+
+    async def save_sentiment(self, data: dict):
+        data["timestamp"] = datetime.utcnow()
+        await self.sentiment_results.insert_one(data)
+
+db = Database()
+
+# ================= JWT Authentication Dependency =================
+async def token_required(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Access token is missing!")
+    
+    try:
+        # Validate token with external API
+        # Note: 'authorization' should be the full value including "Bearer " if required by the service
+        response = requests.get(AUTH_API_URL, headers={"Authorization": authorization})
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        # Extract username from API response
+        # Format: "Hello, jyoti.raut@softelnetworks.com! This is a protected API."
+        match = re.search(r"Hello, (.+?)! This is a protected API", response.text)
+        if not match:
+            logger.error(f"Unexpected API response format: {response.text}")
+            raise HTTPException(status_code=401, detail="Failed to parse identity from auth service")
+        
+        username = match.group(1)
+
+        # Get or create local user record
+        user = await db.get_or_create_user(username)
+        return user
+        
+    except Exception as e:
+        logger.error(f"Token validation error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Token validation failed")
 
 
 app = FastAPI(title="AI Survey Generator API")
@@ -40,14 +126,14 @@ app.add_middleware(
 # ---------------------- Request Schema ----------------------
 class RequestModel(BaseModel):
     query: str
-    model: str
+    model: Optional[str] = DEFAULT_MODEL
     user_id: str = "default_user"
     session_id: str = "default_session"
 
 
 class SentimentRequest(BaseModel):
     responses: list[str]
-    model: str
+    model: Optional[str] = DEFAULT_MODEL
     analysis_type: str = "count"
     custom_prompt: str = None
     user_id: str = "default_user"
@@ -102,13 +188,11 @@ class SurveyGenerator:
         }}
         """
 
-    def call_openai(self, prompt: str, model_name: str):
+    async def call_openai(self, prompt: str, model_name: str):
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-
-
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": "Return ONLY valid JSON."},
@@ -178,13 +262,11 @@ class SentimentAnalyzer:
 
 
 
-    def call_openai(self, prompt: str, model_name: str):
+    async def call_openai(self, prompt: str, model_name: str):
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-
-
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": "Return ONLY valid JSON."},
@@ -218,7 +300,7 @@ class SentimentAnalyzer:
 # ---------------------- ENDPOINTS ----------------------
 
 @app.get("/")
-def read_root():
+async def read_root(user: dict = Depends(token_required)):
     return {
         "message": "Welcome to the AI Survey Generator API!",
         "usage": "Send a POST request to /generate-question with a JSON body.",
@@ -230,7 +312,7 @@ def read_root():
     }
 
 @app.post("/generate-question")
-def generate_question(request: RequestModel):
+async def generate_question(request: RequestModel, user: dict = Depends(token_required)):
 
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
@@ -242,7 +324,7 @@ def generate_question(request: RequestModel):
 
     prompt = generator.build_prompt(topic, num_questions)
 
-    response_json, full_prompt, raw_content = generator.call_openai(prompt, request.model)
+    response_json, full_prompt, raw_content = await generator.call_openai(prompt, request.model)
 
     # cleanup
     for q in response_json.get("questions", []):
@@ -252,9 +334,9 @@ def generate_question(request: RequestModel):
     input_tokens = count_tokens(full_prompt)
     output_tokens = count_tokens(raw_content)
 
-    return {
+    result_data = {
         "status": "success",
-        "user_id": request.user_id,
+        "user_id": user.get("username", request.user_id),
         "session_id": request.session_id,
         "model_used": request.model,
         "topic_detected": topic,
@@ -267,15 +349,20 @@ def generate_question(request: RequestModel):
         "survey": response_json
     }
 
+    # Save to MongoDB
+    await db.save_survey(result_data.copy())
+
+    return result_data
+
 
 @app.post("/analyze-sentiment")
-def analyze_sentiment(request: SentimentRequest):
+async def analyze_sentiment(request: SentimentRequest, user: dict = Depends(token_required)):
     if not request.responses:
         raise HTTPException(status_code=400, detail="Responses list cannot be empty.")
 
     analyzer = SentimentAnalyzer()
     prompt = analyzer.build_prompt(request.responses, request.analysis_type, request.custom_prompt)
-    result, full_prompt, raw_content = analyzer.call_openai(prompt, request.model)
+    result, full_prompt, raw_content = await analyzer.call_openai(prompt, request.model)
 
     # Count tokens
     input_tokens = count_tokens(full_prompt)
@@ -283,7 +370,7 @@ def analyze_sentiment(request: SentimentRequest):
 
     response_data = {
         "status": "success",
-        "user_id": request.user_id,
+        "user_id": user.get("username", request.user_id),
         "session_id": request.session_id,
         "model_used": request.model,
         "analysis_type": request.analysis_type,
@@ -301,6 +388,9 @@ def analyze_sentiment(request: SentimentRequest):
         response_data["sentiment_summary"] = result
     else:
         response_data["sentiment_counts"] = result
+
+    # Save to MongoDB
+    await db.save_sentiment(response_data.copy())
 
     return response_data
 
